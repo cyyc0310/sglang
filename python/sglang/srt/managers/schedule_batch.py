@@ -90,7 +90,7 @@ if TYPE_CHECKING:
     from typing import Any, Dict
 
     from sglang.srt.configs.model_config import ModelConfig
-    from sglang.srt.speculative.eagle_info import EagleDraftInput
+    from sglang.srt.speculative.eagle_info import DraftArtifacts, EagleDraftInput
     from sglang.srt.speculative.spec_info import SpecInput, SpeculativeAlgorithm
 
 INIT_INCREMENTAL_DETOKENIZATION_OFFSET = 5
@@ -738,6 +738,10 @@ class Req:
         # The number of accepted tokens in speculative decoding for this request.
         # This is used to compute the acceptance rate and average acceptance length per request.
         self.spec_accepted_tokens = 0
+
+        # Per-request draft intermediate products for mixed chunk + spec compatibility.
+        # Populated after draft forward, consumed at next round's tree rebuild.
+        self.draft_artifacts = None  # Optional[DraftArtifacts]
 
         # The number of times this request has been retracted / preempted.
         self.retraction_count = 0

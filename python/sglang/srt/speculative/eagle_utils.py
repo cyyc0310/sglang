@@ -1,6 +1,6 @@
 import math
 from enum import IntEnum
-from typing import List, Optional
+from typing import TYPE_CHECKING, List, Optional
 
 import torch
 
@@ -14,6 +14,9 @@ if _is_cuda or _is_hip:
     from sgl_kernel import (
         build_tree_kernel_efficient as sgl_build_tree_kernel_efficient,
     )
+
+if TYPE_CHECKING:
+    from sglang.srt.speculative.eagle_info import DraftArtifacts
 
 
 def organize_draft_results(
@@ -155,6 +158,61 @@ def build_tree_kernel_efficient(
         retrive_next_token,
         retrive_next_sibling,
         draft_tokens,
+    )
+
+
+def build_verify_input_from_artifacts(
+    artifacts_list: List["DraftArtifacts"],
+    seq_lens: torch.Tensor,
+    seq_lens_sum: int,
+    topk: int,
+    spec_steps: int,
+    num_verify_tokens: int,
+    tree_mask_mode: TreeMaskMode = TreeMaskMode.FULL_MASK,
+    tree_mask_buf: Optional[torch.Tensor] = None,
+    position_buf: Optional[torch.Tensor] = None,
+):
+    """Rebuild EagleVerifyInput from per-request DraftArtifacts stored across rounds.
+
+    This replaces the draft→build_tree flow when draft artifacts have already been
+    persisted from the previous round. It stacks per-request tensors into batch-level
+    tensors and calls build_tree_kernel_efficient to reconstruct the tree mask and
+    traversal buffers.
+
+    Args:
+        artifacts_list: Per-request DraftArtifacts from Req.draft_artifacts.
+        seq_lens: Current sequence lengths (before adding verify tokens).
+        seq_lens_sum: Sum of seq_lens.
+        topk: Top-k parameter for draft tree.
+        spec_steps: Number of speculative steps.
+        num_verify_tokens: Number of verify tokens per request.
+        tree_mask_mode: Tree mask construction mode.
+        tree_mask_buf: Pre-allocated buffer for tree mask (optional).
+        position_buf: Pre-allocated buffer for positions (optional).
+
+    Returns:
+        Tuple of (tree_mask, positions, retrive_index, retrive_next_token,
+                  retrive_next_sibling, draft_tokens) — same as build_tree_kernel_efficient.
+    """
+    # Stack per-request artifacts into batch-level tensors
+    parent_list = torch.stack([a.parent_list for a in artifacts_list])
+    top_scores_index = torch.stack([a.top_scores_index for a in artifacts_list])
+    draft_tokens = torch.stack([a.draft_tokens for a in artifacts_list])
+    verified_id = torch.stack([a.verified_id for a in artifacts_list])
+
+    return build_tree_kernel_efficient(
+        verified_id=verified_id,
+        parent_list=parent_list,
+        top_scores_index=top_scores_index,
+        draft_tokens=draft_tokens,
+        seq_lens=seq_lens,
+        seq_lens_sum=seq_lens_sum,
+        topk=topk,
+        spec_steps=spec_steps,
+        num_verify_tokens=num_verify_tokens,
+        tree_mask_mode=tree_mask_mode,
+        tree_mask_buf=tree_mask_buf,
+        position_buf=position_buf,
     )
 
 

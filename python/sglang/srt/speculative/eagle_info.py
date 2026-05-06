@@ -52,6 +52,29 @@ logger = logging.getLogger(__name__)
 
 
 @dataclass
+class DraftArtifacts:
+    """Per-request draft intermediate products, persisted across rounds.
+
+    Stored on Req.draft_artifacts after draft forward completes.
+    Used to rebuild EagleVerifyInput at the start of the next round,
+    avoiding the need to re-run draft before the target forward.
+    """
+
+    # Tree topology from organize_draft_results
+    parent_list: torch.Tensor  # parent index per draft node
+    top_scores_index: torch.Tensor  # sorted indices of top-k scoring candidates
+    draft_tokens: torch.Tensor  # selected draft token IDs
+
+    # Last accepted token from previous round's verify/sample
+    verified_id: torch.Tensor  # scalar tensor
+
+    # For next round's draft extend input
+    topk_p: torch.Tensor  # (topk,) probabilities
+    topk_index: torch.Tensor  # (topk,) token IDs
+    hidden_states: torch.Tensor  # (hidden_size,) last hidden state
+
+
+@dataclass
 class EagleVerifyInput(SpecInput, EagleVerifyInputV2Mixin):
     draft_token: torch.Tensor
     custom_mask: torch.Tensor

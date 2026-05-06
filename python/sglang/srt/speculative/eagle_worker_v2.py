@@ -35,13 +35,21 @@ from sglang.srt.speculative.eagle_draft_cuda_graph_runner import (
 from sglang.srt.speculative.eagle_draft_extend_cuda_graph_runner import (
     EAGLEDraftExtendCudaGraphRunner,
 )
-from sglang.srt.speculative.eagle_info import EagleDraftInput, EagleVerifyInput
+from sglang.srt.speculative.eagle_info import (
+    DraftArtifacts,
+    EagleDraftInput,
+    EagleVerifyInput,
+)
 from sglang.srt.speculative.eagle_info_v2 import (
     assign_extend_cache_locs,
     fill_accepted_out_cache_loc,
     fill_new_verified_id,
 )
-from sglang.srt.speculative.eagle_utils import TreeMaskMode, build_tree_kernel_efficient
+from sglang.srt.speculative.eagle_utils import (
+    TreeMaskMode,
+    build_tree_kernel_efficient,
+    build_verify_input_from_artifacts,
+)
 from sglang.srt.speculative.spec_info import SpeculativeAlgorithm
 from sglang.srt.speculative.spec_utils import (
     detect_nan,
@@ -326,13 +334,17 @@ class EagleDraftWorker(BaseDraftWorker):
                 self.topk,
                 self.speculative_num_steps,
                 self.speculative_num_draft_tokens,
-            )
+            ), None
 
         # Build tree mask
         # Directly write to cuda graph buffers for verify attn
         tree_mask_buf, position_buf = (
             self.target_worker.model_runner.attn_backend.get_verify_buffers_to_fill_after_draft()
         )
+
+        # Save raw artifacts BEFORE build_tree_kernel_efficient mutates draft_tokens.
+        # The build function prepends verified_id and flattens draft_tokens in-place.
+        raw_artifacts = (parent_list, top_scores_index, draft_tokens, draft_input.verified_id)
 
         (
             tree_mask,
@@ -356,7 +368,7 @@ class EagleDraftWorker(BaseDraftWorker):
             position_buf,
         )
 
-        return EagleVerifyInput(
+        verify_input = EagleVerifyInput(
             draft_token=draft_tokens,
             custom_mask=tree_mask,
             positions=position,
@@ -371,6 +383,8 @@ class EagleDraftWorker(BaseDraftWorker):
             seq_lens_sum=None,
             seq_lens_cpu=None,
         )
+
+        return verify_input, raw_artifacts
 
     def draft_forward(self, forward_batch: ForwardBatch):
         # Parse args
@@ -631,7 +645,39 @@ class EAGLEWorkerV2(BaseSpecWorker):
         # allocator and kv cache pool are shared with target worker, which are cleared in scheduler
         pass
 
+    def _store_draft_artifacts(
+        self,
+        batch: ModelWorkerBatch,
+        raw_artifacts: Tuple,
+        batch_result: GenerationBatchResult,
+    ):
+        """Store per-request draft intermediate products on Req.draft_artifacts.
+
+        Called after _draft_extend_for_decode completes, when topk_p/topk_index/hidden_states
+        are available on batch_result.next_draft_input.
+        """
+        parent_list, top_scores_index, draft_tokens, verified_id = raw_artifacts
+        next_draft = batch_result.next_draft_input
+        reqs = batch.reqs
+
+        for i, req in enumerate(reqs):
+            req.draft_artifacts = DraftArtifacts(
+                parent_list=parent_list[i],
+                top_scores_index=top_scores_index[i],
+                draft_tokens=draft_tokens[i],
+                verified_id=verified_id[i],
+                topk_p=next_draft.topk_p[i],
+                topk_index=next_draft.topk_index[i],
+                hidden_states=next_draft.hidden_states[i],
+            )
+
     def forward_batch_generation(self, model_worker_batch: ModelWorkerBatch):
+        # NOTE: ForwardMode.MIXED also makes is_extend() return True.
+        # We must check is_mixed() FIRST to avoid the mixed batch being
+        # routed into the extend-only path.
+        if model_worker_batch.forward_mode.is_mixed():
+            return self._forward_mixed_batch(model_worker_batch)
+
         if (
             model_worker_batch.forward_mode.is_extend()
             or model_worker_batch.is_extend_in_batch
@@ -655,31 +701,159 @@ class EAGLEWorkerV2(BaseSpecWorker):
                     )
                 )
                 return batch_output
-        else:
-            if model_worker_batch.spec_info is None:
-                model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
-                    device=self.device,
-                    hidden_size=self.target_worker.model_config.hidden_size,
-                    dtype=self.target_worker.model_config.dtype,
-                    topk=self.topk,
-                    capture_hidden_mode=CaptureHiddenMode.LAST,
-                )
+        elif not model_worker_batch.forward_mode.is_decode_or_idle():
+            raise ValueError(
+                f"Unexpected forward_mode: {model_worker_batch.forward_mode}"
+            )
+
+        # Decode-only path
+        return self._forward_decode_batch(model_worker_batch)
+
+    def _forward_decode_batch(self, model_worker_batch: ModelWorkerBatch):
+        """Decode-only path: draft -> verify -> draft_extend."""
+        if model_worker_batch.spec_info is None:
+            model_worker_batch.spec_info = EagleDraftInput.create_idle_input(
+                device=self.device,
+                hidden_size=self.target_worker.model_config.hidden_size,
+                dtype=self.target_worker.model_config.dtype,
+                topk=self.topk,
+                capture_hidden_mode=CaptureHiddenMode.LAST,
+            )
+        with self.draft_worker.draft_tp_context(
+            self.draft_worker.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            verify_input: EagleVerifyInput
+            raw_artifacts: Optional[Tuple]
+            verify_input, raw_artifacts = self.draft_worker.draft(
+                model_worker_batch
+            )
+        assert verify_input.is_verify_input()
+        model_worker_batch.spec_info = verify_input
+        batch_output = self.verify(model_worker_batch)
+        with self.draft_worker.draft_tp_context(
+            self.draft_worker.draft_runner.tp_group
+        ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
+            self.draft_worker._draft_extend_for_decode(
+                model_worker_batch, batch_output
+            )
+
+        # Store draft artifacts per-request for cross-round persistence.
+        if raw_artifacts is not None and model_worker_batch.reqs is not None:
+            self._store_draft_artifacts(
+                model_worker_batch, raw_artifacts, batch_output
+            )
+
+        return batch_output
+
+    def _forward_mixed_batch(self, model_worker_batch: ModelWorkerBatch):
+        """Mixed batch path: prefill P + decode D in one round.
+
+        New execution order (avoids draft blocking prefill):
+          1. Build tree from stored draft artifacts (D only)
+          2. Target forward: P extend + D verify (two separate forwards, overlappable)
+          3. Sample: P normal sample, D rejection sampling
+          4. Return merged results
+          5. Draft forward: D + newly-prefilled P
+          6. Store draft artifacts per-request
+        """
+        reqs = model_worker_batch.reqs
+        if reqs is None:
+            raise ValueError("MIXED batch requires reqs to be set on ModelWorkerBatch")
+
+        # Step 0: Classify requests by whether they have draft artifacts
+        d_indices = [i for i, r in enumerate(reqs) if r.draft_artifacts is not None]
+        p_indices = [i for i, r in enumerate(reqs) if r.draft_artifacts is None]
+
+        has_decode = len(d_indices) > 0
+        has_prefill = len(p_indices) > 0
+
+        # --- Step 1: Target forward for P (normal extend) ---
+        p_batch_output = None
+        p_next_draft_input = None
+        if has_prefill:
+            # P requests use normal extend forward
+            # TODO: Split the batch and run P requests through target extend.
+            # For now, fall back to treating the whole batch as extend when
+            # there are no decode requests with artifacts yet.
+            # This will be implemented in the next iteration with proper
+            # batch splitting.
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.FULL
+            p_batch_output = self.target_worker.forward_batch_generation(
+                model_worker_batch
+            )
+
+        # --- Step 2: Target forward for D (verify from stored artifacts) ---
+        d_batch_output = None
+        if has_decode and has_prefill:
+            # FALLBACK: D requests are treated as extend-1 (normal decode) in this
+            # round. Spec verification for D will happen in the next pure-decode round.
+            # This means D requests lose spec acceleration for this round but gain
+            # the benefit of not blocking P's prefill.
+            #
+            # TODO: Split the batch into P-only and D-only sub-batches,
+            # rebuild tree from D's stored artifacts, run D verify separately,
+            # then merge results. This requires batch splitting utilities.
+            logger.warning_once(
+                "MIXED+spec fallback: D requests treated as extend-1 this round. "
+                "Full mixed spec verification is not yet implemented."
+            )
+        elif has_decode and not has_prefill:
+            # Pure decode: use the standard decode path
+            return self._forward_decode_batch(model_worker_batch)
+
+        # If we reached here with P requests, return the extend output.
+        # D requests will be handled in the next decode-only round.
+        if p_batch_output is not None:
+            # Run draft prefill for the P requests
+            model_worker_batch.capture_hidden_mode = CaptureHiddenMode.LAST
             with self.draft_worker.draft_tp_context(
                 self.draft_worker.draft_runner.tp_group
             ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                verify_input: EagleVerifyInput = self.draft_worker.draft(
-                    model_worker_batch
+                p_batch_output.next_draft_input = (
+                    self.draft_worker._draft_extend_for_prefill(
+                        model_worker_batch,
+                        p_batch_output.logits_output.hidden_states,
+                        p_batch_output.next_token_ids,
+                    )
                 )
-            assert verify_input.is_verify_input()
-            model_worker_batch.spec_info = verify_input
-            batch_output = self.verify(model_worker_batch)
-            with self.draft_worker.draft_tp_context(
-                self.draft_worker.draft_runner.tp_group
-            ), speculative_moe_backend_context(), speculative_moe_a2a_backend_context():
-                self.draft_worker._draft_extend_for_decode(
-                    model_worker_batch, batch_output
-                )
-            return batch_output
+
+                # Store draft artifacts for P requests that just completed prefill
+                # (they will have draft_artifacts populated for the next round)
+                next_draft = p_batch_output.next_draft_input
+                for i, idx in enumerate(p_indices):
+                    if reqs[idx].draft_artifacts is None:
+                        # Only store if this is a newly completed prefill
+                        # (not a chunked prefill that still needs more chunks)
+                        # For now, we store for all P requests.
+                        # TODO: Only store for requests that completed prefill.
+                        reqs[idx].draft_artifacts = DraftArtifacts(
+                            parent_list=torch.empty(
+                                0, device=self.device, dtype=torch.long
+                            ),
+                            top_scores_index=torch.empty(
+                                self.speculative_num_draft_tokens - 1,
+                                device=self.device,
+                                dtype=torch.long,
+                            ),
+                            draft_tokens=torch.empty(
+                                self.speculative_num_draft_tokens - 1,
+                                device=self.device,
+                                dtype=torch.long,
+                            ),
+                            verified_id=p_batch_output.next_token_ids[
+                                idx
+                            ].clone(),
+                            topk_p=next_draft.topk_p[i].clone(),
+                            topk_index=next_draft.topk_index[i].clone(),
+                            hidden_states=next_draft.hidden_states[
+                                i
+                            ].clone(),
+                        )
+
+            return p_batch_output
+
+        # Should not reach here
+        raise ValueError("MIXED batch with no prefill and no decode requests")
 
     def verify(self, batch: ModelWorkerBatch):
         # Since batch.seq_lens is allocated in another stream, we need

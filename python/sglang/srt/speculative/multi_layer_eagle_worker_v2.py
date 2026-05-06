@@ -608,7 +608,7 @@ class MultiLayerEagleWorkerV2(BaseSpecWorker):
                     capture_hidden_mode=CaptureHiddenMode.LAST,
                 )
             draft_input: EagleDraftInput = model_worker_batch.spec_info
-            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)
+            verify_input: EagleVerifyInput = self.draft_worker.draft(model_worker_batch)[0]
             assert verify_input.is_verify_input()
             model_worker_batch.spec_info = verify_input
             batch_output = self.verify(model_worker_batch)
