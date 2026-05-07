@@ -510,7 +510,7 @@ class MambaRadixCache(BasePrefixCache):
             kv_indices = self.req_to_token_pool.req_to_token[
                 req.req_pool_idx, :kv_committed_len
             ]
-            self.token_to_kv_pool_allocator.free(kv_indices)
+            self.token_to_kv_pool_allocator.free(kv_indices.clone())
             self.req_to_token_pool.free_mamba_cache(req)
             return
 
@@ -529,7 +529,8 @@ class MambaRadixCache(BasePrefixCache):
                 cache_len = 0
             if cache_len != len(token_ids):
                 cache_end_idx = max(cache_len, req.cache_protected_len)
-                self.token_to_kv_pool_allocator.free(kv_indices[cache_end_idx:])
+                to_free = kv_indices[cache_end_idx:].clone()
+                self.token_to_kv_pool_allocator.free(to_free)
                 token_ids = token_ids[:cache_len]
                 kv_indices = kv_indices[:cache_len]
 
@@ -575,7 +576,7 @@ class MambaRadixCache(BasePrefixCache):
             )
             mamba_exist = result.mamba_exist
         else:
-            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :])
+            self.token_to_kv_pool_allocator.free(kv_indices[req.cache_protected_len :].clone())
             mamba_exist = True
 
         if mamba_exist:

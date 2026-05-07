@@ -366,6 +366,9 @@ class ServerArgs:
     max_total_tokens: Optional[int] = None
     chunked_prefill_size: Optional[int] = None
     enable_dynamic_chunking: bool = False
+    # Max total tokens per scheduling iteration (prefill + decode combined).
+    # In unified scheduling mode, this serves as the global token budget shared
+    # across all requests, similar to vLLM's max_num_scheduled_tokens.
     max_prefill_tokens: int = 16384
     prefill_max_requests: Optional[int] = None
     schedule_policy: str = "fcfs"
@@ -657,7 +660,7 @@ class ServerArgs:
         default_factory=lambda: is_hip()
     )  # Pre-warm NCCL/RCCL to reduce P99 TTFT cold-start latency (default: True for AMD/HIP, False for others)
     disable_overlap_schedule: bool = False
-    enable_mixed_chunk: bool = False
+    enable_mixed_chunk: bool = True
     enable_dp_attention: bool = False
     enable_dp_attention_local_control_broadcast: bool = False
     enable_dp_lm_head: bool = False

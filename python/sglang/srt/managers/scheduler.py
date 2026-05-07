@@ -2493,6 +2493,8 @@ class Scheduler(
                 self.running_batch.batch_is_full = False
 
             # Merge the new batch into the running batch.
+            # Mid-prefill requests (is_prefill_chunk=True) are kept in
+            # running_batch and will be extracted for prefill scheduling below.
             if not self.last_batch.is_empty():
                 if self.running_batch.is_empty():
                     self.running_batch = self.last_batch
@@ -2510,10 +2512,42 @@ class Scheduler(
             if self.running_batch.is_empty():
                 self.running_batch.batch_is_full = False
 
+        # Extract mid-prefill requests from running_batch for unified scheduling.
+        # These are requests whose prefill is not yet complete (is_prefill_chunk=True).
+        # They must be removed from running_batch before prepare_for_decode is called,
+        # since decode requires all requests to have finished prefill.
+        # The radix tree has already been updated via cache_unfinished_req in
+        # process_batch_result_prefill, so the KV is properly managed.
+        resume_prefill_reqs = None
+        if not self.running_batch.is_empty() and not self.running_batch.is_prefill_only:
+            mid_prefill_set = set()
+            for req in self.running_batch.reqs:
+                if req.is_prefill_chunk and not req.finished() and not req.is_retracted:
+                    if resume_prefill_reqs is None:
+                        resume_prefill_reqs = []
+                    resume_prefill_reqs.append(req)
+                    mid_prefill_set.add(req)
+
+            # Remove mid-prefill requests from running_batch tensors
+            if mid_prefill_set:
+                keep_indices = [
+                    i for i, req in enumerate(self.running_batch.reqs)
+                    if req not in mid_prefill_set
+                ]
+                if len(keep_indices) < len(self.running_batch.reqs):
+                    self.running_batch.filter_batch(keep_indices=keep_indices)
+                    # Note: filter_batch frees req_pool_idx for removed requests,
+                    # but mid-prefill requests keep their slots because they're
+                    # still alive (just not in running_batch tensors anymore).
+                    # Actually, filter_batch does NOT free req_pool_idx - it only
+                    # removes from tensor views. The slots remain allocated.
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm()
         else:
-            new_batch = self.get_new_batch_prefill()
+            new_batch = self.get_new_batch_prefill(
+                resume_prefill_reqs=resume_prefill_reqs
+            )
 
         need_mlp_sync = self.require_mlp_sync
         if (
@@ -2529,10 +2563,17 @@ class Scheduler(
             need_mlp_sync = new_batch is None
 
         if new_batch is not None:
-            # Run prefill first if possible
-            ret = new_batch
+            # Check if decode requests were successfully mixed into the prefill batch
+            if new_batch.decoding_reqs is not None or self.running_batch.is_empty():
+                # Mixed batch (prefill + decode) or pure prefill (no decode reqs)
+                ret = new_batch
+            else:
+                # Mix failed (e.g., logprob/embeds conflict) but decode reqs exist.
+                # Prioritize decode over prefill (running-first).
+                self.running_batch = self.update_running_batch(self.running_batch)
+                ret = self.running_batch if not self.running_batch.is_empty() else new_batch
         else:
-            # Run decode (skip for prefill-only batches)
+            # No prefill batch, run pure decode
             if (
                 not self.running_batch.is_empty()
                 and not self.running_batch.is_prefill_only
@@ -2558,7 +2599,9 @@ class Scheduler(
         res = min(res, self.req_to_token_pool.available_size())
         return res
 
-    def get_new_batch_prefill(self) -> Optional[ScheduleBatch]:
+    def get_new_batch_prefill(
+        self, resume_prefill_reqs: Optional[List[Req]] = None
+    ) -> Optional[ScheduleBatch]:
         prefill_delayer_single_pass = None
         if self.prefill_delayer:
             # Get max usage across all pools for prefill delay decision
@@ -2568,7 +2611,8 @@ class Scheduler(
             )
 
         ret = self._get_new_batch_prefill_raw(
-            prefill_delayer_single_pass=prefill_delayer_single_pass
+            prefill_delayer_single_pass=prefill_delayer_single_pass,
+            resume_prefill_reqs=resume_prefill_reqs,
         )
 
         if self.prefill_delayer:
@@ -2577,7 +2621,9 @@ class Scheduler(
         return ret
 
     def _get_new_batch_prefill_raw(
-        self, prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor]
+        self,
+        prefill_delayer_single_pass: Optional[PrefillDelayerSinglePassExecutor],
+        resume_prefill_reqs: Optional[List[Req]] = None,
     ) -> Optional[ScheduleBatch]:
         # Check if the grammar is ready in the grammar queue
         if self.grammar_manager.has_waiting_grammars():
@@ -2592,9 +2638,10 @@ class Scheduler(
             # Reset batch_is_full to try preemption with a prefill adder.
             self.running_batch.batch_is_full = False
 
+        has_resume = resume_prefill_reqs and len(resume_prefill_reqs) > 0
         if (
             self.running_batch.batch_is_full or len(self.waiting_queue) == 0
-        ) and self.chunked_req is None:
+        ) and self.chunked_req is None and not has_resume:
             return None
 
         running_bs = len(self.running_batch.reqs)
@@ -2607,6 +2654,7 @@ class Scheduler(
         if (
             self.get_num_allocatable_reqs(running_bs) <= 0
             and self.chunked_req is None
+            and not has_resume
             and not self.enable_priority_preemption
         ):
             self.running_batch.batch_is_full = True
@@ -2638,7 +2686,7 @@ class Scheduler(
             self.new_token_ratio,
             self.max_prefill_tokens,
             chunked_prefill_size,
-            running_bs if self.is_mixed_chunk else 0,
+            running_bs,  # Always reserve budget for decode in mixed scheduling
             self.priority_scheduling_preemption_threshold,
             max_prefill_bs=self.max_prefill_bs,
             max_running_requests=self.max_running_requests,
@@ -2655,6 +2703,21 @@ class Scheduler(
             )
         else:
             self._chunked_req_scheduled_last_iter = False
+
+        # Process resume_prefill_reqs: mid-prefill requests extracted from
+        # running_batch that need to continue their prefill in this iteration.
+        # They use init_next_round_input's mid-prefill path which reads
+        # existing KV from req_to_token_pool via num_computed_tokens.
+        if has_resume:
+            for req in resume_prefill_reqs:
+                req.init_next_round_input(self.tree_cache)
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None or has_resume),
+                    truncation_align_size=self.truncation_align_size,
+                )
+                if res != AddReqResult.CONTINUE:
+                    break
 
         if self.enable_lora:
             running_loras = {req.lora_id for req in self.running_batch.reqs}
@@ -2794,15 +2857,16 @@ class Scheduler(
             ),
         )
 
-        # Mixed-style chunked prefill
+        # Mixed-style: combine prefill with running decode requests.
+        # Always attempt mixing when running_batch has decode requests.
+        # Logprob is now supported: decode requests have extend_logprob_start_len=1
+        # (matching extend_input_len), contributing 0 input logprob entries so
+        # extend_input_logprob_token_ids (built for prefill only) stays valid.
         if (
-            self.is_mixed_chunk
-            and not self.running_batch.is_empty()
-            and not (new_batch.return_logprob or self.running_batch.return_logprob)
+            not self.running_batch.is_empty()
             # mix_with_running cats input_ids but not input_embeds — shapes would mismatch
             and new_batch.input_embeds is None
         ):
-            # TODO (lianmin): support return_logprob + mixed chunked prefill
             self.running_batch.filter_batch(v1_spec_info_filtered=True)
             if not self.running_batch.is_empty():
                 self.running_batch.prepare_for_decode()

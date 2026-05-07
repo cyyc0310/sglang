@@ -544,7 +544,9 @@ class PrefillAdder:
         return -(-tokens // self.page_size) * self.page_size
 
     def budget_state(self):
-        no_token = self.rem_total_tokens <= 0 or self.cur_rem_tokens <= 0
+        # cur_rem_tokens <= 0 is redundant: cur_rem_token_offset <=
+        # rem_total_token_offset always, so cur_rem_tokens >= rem_total_tokens.
+        no_token = self.rem_total_tokens <= 0
         if not no_token and self.is_hybrid_swa:
             no_token = self.rem_swa_tokens <= 0
         if no_token:
@@ -698,7 +700,7 @@ class PrefillAdder:
 
     def add_one_req_ignore_eos(self, req: Req):
         paged_input = self.ceil_paged_tokens(req.extend_input_len)
-        if paged_input > min(self.cur_rem_tokens, self.rem_total_tokens):
+        if paged_input > self.rem_total_tokens:
             return AddReqResult.NO_TOKEN
         if self.is_hybrid_swa:
             if self._swa_budget_for_req(req.extend_input_len) > self.rem_swa_tokens:

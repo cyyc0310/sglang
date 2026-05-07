@@ -640,6 +640,13 @@ class Req(ReqDllmMixin):
         self.kv_committed_freed = False
         self.kv_overallocated_freed = False
 
+        # Tracks how many tokens have had their KV cache computed so far.
+        # After prefix cache hit: set to len(prefix_indices).
+        # After each extend forward: advanced by extend_input_len.
+        # After each decode forward: advanced by 1 (or spec draft count).
+        # When num_computed_tokens == total tokens, all KV is available.
+        self.num_computed_tokens = 0
+
         # for corss-endoder model
         self.token_type_ids = token_type_ids
 
@@ -920,6 +927,16 @@ class Req(ReqDllmMixin):
         return self.sampling_params.max_new_tokens == 0 and spec_alg is None
 
     @property
+    def is_prefill_chunk(self) -> bool:
+        """Whether this request still has prefill tokens to compute.
+
+        True when the number of computed tokens is less than the prompt length,
+        meaning there are still input tokens whose KV cache has not been generated.
+        This is derived after scheduling, not a scheduling decision itself.
+        """
+        return self.num_computed_tokens < len(self.origin_input_ids)
+
+    @property
     def output_ids_through_stop(self) -> List[int]:
         """Get the output ids through the stop condition. Stop position is included."""
         if self.finished_len is not None:
@@ -1064,6 +1081,12 @@ class Req(ReqDllmMixin):
             )
 
         self.set_extend_input_len(len(self.fill_ids) - len(self.prefix_indices))
+
+        # Sync num_computed_tokens with the radix tree prefix match.
+        # This represents how many tokens have their KV cached so far.
+        # - For new requests: set to prefix cache hit length
+        # - For retracted requests: correctly resets to available prefix
+        self.num_computed_tokens = len(self.prefix_indices)
 
     # Based on https://github.com/vllm-project/vllm/blob/7a64d24aad69e4d2548aa0bf528d9fe63428ab01/vllm/transformers_utils/detokenizer.py#L194-L313
     def init_incremental_detokenize(self):
@@ -1253,6 +1276,7 @@ class Req(ReqDllmMixin):
         self.mamba_last_track_seqlen = None
         self.mamba_branching_seqlen = None
         self.already_computed = 0
+        self.num_computed_tokens = 0
         self.kv_allocated_len = 0
         self.kv_committed_len = 0
         self.kv_committed_freed = False
@@ -1751,6 +1775,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             # update req-level memory management fields
             req.kv_committed_len = seq_len
             req.kv_allocated_len = seq_len
+            req.num_computed_tokens = seq_len
 
             # If input_embeds are available, store them
             if req.input_embeds is not None:
@@ -2116,8 +2141,10 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         )
         self.extend_lens.extend([1] * running_bs)
         self.extend_num_tokens += running_bs
-        # TODO (lianmin): Revisit this. It should be seq_len - 1
-        self.extend_logprob_start_lens.extend([0] * running_bs)
+        # Decode requests have extend_input_len=1 and contribute 0 input logprob
+        # entries (extend_logprob_start_len == extend_input_len). This avoids
+        # padding extend_input_logprob_token_ids which only has prefill entries.
+        self.extend_logprob_start_lens.extend([1] * running_bs)
         self.is_prefill_only = False
 
     def new_tokens_required_next_decode(

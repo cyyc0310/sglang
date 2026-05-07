@@ -432,6 +432,11 @@ def alloc_for_extend(
     """
     Allocate KV cache for extend batch and write to req_to_token_pool.
 
+    Supports two types of requests:
+    - New requests (req_pool_idx is None): allocate new req slot + KV tokens
+    - Resume mid-prefill requests (req_pool_idx is set): reuse req slot,
+      only allocate additional KV tokens for the extend portion.
+
     Returns:
         out_cache_loc: allocated cache locations
         req_pool_indices_device: request pool indices at a device tensor
@@ -448,10 +453,20 @@ def alloc_for_extend(
     prefix_lens_device = prefix_lens_cpu.to(batch.device, non_blocking=True)
     extend_lens_device = extend_lens_cpu.to(batch.device, non_blocking=True)
 
-    # Allocate req slots
-    req_pool_indices = alloc_req_slots(
-        batch.req_to_token_pool, batch.reqs, batch.tree_cache
-    )
+    # Allocate req slots: reuse existing slots for resume mid-prefill requests.
+    # Collect new request indices BEFORE alloc_req_slots, which sets req_pool_idx.
+    new_req_indices = [i for i, r in enumerate(batch.reqs) if r.req_pool_idx is None]
+    new_reqs = [batch.reqs[i] for i in new_req_indices]
+    req_pool_indices = [r.req_pool_idx for r in batch.reqs]
+
+    if new_reqs:
+        new_indices = alloc_req_slots(
+            batch.req_to_token_pool, new_reqs, batch.tree_cache
+        )
+        # Map new indices back to the correct positions
+        for pos, idx in enumerate(new_req_indices):
+            req_pool_indices[idx] = new_indices[pos]
+
     req_pool_indices_cpu = torch.tensor(req_pool_indices, dtype=torch.int64)
     req_pool_indices_device = req_pool_indices_cpu.to(batch.device, non_blocking=True)
 

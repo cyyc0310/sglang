@@ -315,7 +315,8 @@ class SchedulerRuntimeCheckerMixin:
             protected = self.tree_cache.protected_size()
             session_held = self._session_held_tokens()
             total = self.max_total_num_tokens
-        return self._check_pool_invariant(
+
+        leak, msg = self._check_pool_invariant(
             "full",
             ps.full_available_size,
             ps.full_evictable_size,
@@ -324,6 +325,32 @@ class SchedulerRuntimeCheckerMixin:
             total,
             uncached,
         )
+
+        # Diagnostic: dump leaked page indices for hybrid SSM full pool
+        if leak and self.is_hybrid_ssm and self.tree_cache.supports_mamba():
+            allocator = self.token_to_kv_pool_allocator
+            free_pages = set(
+                allocator.free_pages.tolist()
+                + allocator.release_pages.tolist()
+            )
+            cached_pages = set()
+            if self.tree_cache.is_tree_cache():
+                cached_pages = set(
+                    self.tree_cache.all_values_flatten().tolist()
+                )
+            expected = set(range(1, total + 1))
+            leaked = expected - free_pages - cached_pages
+            if leaked:
+                leaked_sorted = sorted(leaked)
+                logger.warning(
+                    f"[full pool leak diag] {len(leaked)} leaked pages: "
+                    f"first 20 = {leaked_sorted[:20]}, "
+                    f"free_count={len(free_pages)}, cached_count={len(cached_pages)}, "
+                    f"running_batch={getattr(self, 'running_batch', None) is not None}, "
+                    f"last_batch={getattr(self, 'last_batch', None) is not None}"
+                )
+
+        return leak, msg
 
     def _check_swa_pool(
         self: Scheduler, ps: PoolStats, uncached: int = 0

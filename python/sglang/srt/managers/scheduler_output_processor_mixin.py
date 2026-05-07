@@ -201,6 +201,11 @@ class SchedulerOutputProcessorMixin:
 
             hidden_state_offset = 0
 
+            # Pre-compute decode set for O(1) lookup in mixed batch
+            decoding_reqs_set = (
+                set(batch.decoding_reqs) if batch.decoding_reqs is not None else None
+            )
+
             # Check finish conditions
             logprob_pt = 0
 
@@ -208,6 +213,84 @@ class SchedulerOutputProcessorMixin:
                 if req.finished() or req.is_retracted:
                     # decode req in mixed batch or retracted req
                     continue
+
+                # Decode requests in a mixed batch: they ran through the extend
+                # forward path but need decode-style post-processing.
+                if decoding_reqs_set is not None and req in decoding_reqs_set:
+                    req.output_ids.append(next_token_id)
+                    req.num_computed_tokens += 1
+                    self._maybe_update_reasoning_tokens(req, next_token_id)
+                    req.time_stats.set_last_decode_finish_time()
+                    req.check_finished()
+                    if req.finished():
+                        self.maybe_collect_routed_experts(req)
+                        self.maybe_collect_indexer_topk(req)
+                        release_kv_cache(req, self.tree_cache)
+                        req.time_stats.set_completion_time()
+
+                    if batch.return_logprob and req.return_logprob:
+                        # Decode logprobs come from next_token_logprobs (sampled logits),
+                        # not from input logprobs (lm_head over hidden states).
+                        if logits_output.next_token_logprobs is not None:
+                            req.output_token_logprobs_val.append(
+                                logits_output.next_token_logprobs[i]
+                            )
+                            req.output_token_logprobs_idx.append(next_token_id)
+                        if req.top_logprobs_num > 0:
+                            req.output_top_logprobs_val.append(
+                                logits_output.next_token_top_logprobs_val[i]
+                            )
+                            req.output_top_logprobs_idx.append(
+                                logits_output.next_token_top_logprobs_idx[i]
+                            )
+                        if (
+                            req.token_ids_logprob is not None
+                            and logits_output.next_token_token_ids_logprobs_val
+                            is not None
+                        ):
+                            logprobs_val = (
+                                logits_output.next_token_token_ids_logprobs_val[i]
+                            )
+                            if isinstance(logprobs_val, torch.Tensor):
+                                logprobs_val = logprobs_val.tolist()
+                            req.output_token_ids_logprobs_val.append(logprobs_val)
+                            req.output_token_ids_logprobs_idx.append(
+                                logits_output.next_token_token_ids_logprobs_idx[i]
+                            )
+
+                    if req.grammar is not None:
+                        try:
+                            req.grammar.accept_token(next_token_id)
+                        except ValueError as e:
+                            logger.error(
+                                f"Grammar accept_token failed for req {req.rid}"
+                                f" with token {next_token_id}: {e}"
+                            )
+                            self.abort_request(AbortReq(rid=req.rid))
+                        req.grammar.finished = req.finished()
+
+                    # Decode requests contribute 1 token to the flattened
+                    # hidden_states layout — keep the offset in sync.
+                    if req.return_hidden_states and logits_output.hidden_states is not None:
+                        req.hidden_states.append(
+                            logits_output.hidden_states[
+                                hidden_state_offset : hidden_state_offset + 1
+                            ]
+                            .cpu()
+                            .clone()
+                            .tolist()
+                        )
+                        hidden_state_offset += 1
+                    continue
+
+                # Advance computed tokens by what was scheduled in this extend step.
+                # NOTE: forward_batch_generation already sets num_computed_tokens = seq_len
+                # during batch preparation, so we only need to update here if it wasn't
+                # already set (safety net for non-overlap paths).
+                if req.extend_input_len > 0:
+                    req.num_computed_tokens = max(
+                        req.num_computed_tokens, req.kv_committed_len
+                    )
 
                 if req.is_chunked <= 0:
                     req.time_stats.set_prefill_finished_time()
@@ -223,7 +306,7 @@ class SchedulerOutputProcessorMixin:
                         self.maybe_collect_indexer_topk(req)
                         release_kv_cache(req, self.tree_cache)
                         req.time_stats.set_completion_time()
-                    elif not batch.decoding_reqs or req not in batch.decoding_reqs:
+                    elif not decoding_reqs_set or req not in decoding_reqs_set:
                         maybe_cache_unfinished_req(req, self.tree_cache)
                         if self.enable_hisparse:
                             self.hisparse_coordinator.admit_request_into_staging(req)
@@ -287,6 +370,12 @@ class SchedulerOutputProcessorMixin:
                     # Because this request does not finish prefill,
                     # we don't want to stream the request currently being chunked.
                     skip_stream_req = req
+
+                    # Cache the computed KV into radix tree for prefix sharing
+                    # and eviction management. Unlike the old stash mechanism,
+                    # we keep req_pool_idx allocated so the request can resume
+                    # directly in the next iteration via running_batch.
+                    maybe_cache_unfinished_req(req, self.tree_cache, chunked=True)
 
                     # Incrementally update input logprobs.
                     if batch.return_logprob:
@@ -359,6 +448,12 @@ class SchedulerOutputProcessorMixin:
                         req.time_stats.set_completion_time()
                     else:
                         maybe_cache_unfinished_req(req, self.tree_cache)
+
+                    # Advance computed tokens for embedding requests
+                    if req.extend_input_len > 0:
+                        req.num_computed_tokens = max(
+                            req.num_computed_tokens, req.kv_committed_len
+                        )
                 else:
                     # being chunked reqs' prefill is not finished
                     req.is_chunked -= 1
@@ -487,6 +582,8 @@ class SchedulerOutputProcessorMixin:
             if is_spec_v1:
                 self._mamba_prefix_cache_update(req, batch, result, i)
                 req.time_stats.set_last_decode_finish_time()
+                # For spec v1, verify phase already updated output_ids.
+                req.num_computed_tokens = len(req.origin_input_ids) + len(req.output_ids)
                 self._handle_finished_req(req, i, logits_output)
                 if req.return_hidden_states and logits_output.hidden_states is not None:
                     req.hidden_states.append(
@@ -504,6 +601,9 @@ class SchedulerOutputProcessorMixin:
             else:
                 req.output_ids.extend(next_token_id)
                 new_accepted_len = len(next_token_id)
+
+            # Advance computed tokens by the number of newly generated tokens.
+            req.num_computed_tokens += new_accepted_len
 
             self._maybe_update_reasoning_tokens(req, next_token_id)
 
